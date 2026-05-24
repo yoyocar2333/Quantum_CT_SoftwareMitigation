@@ -1,11 +1,11 @@
-from qiskit import QuantumCircuit
+# from qiskit import QuantumCircuit
 
 class Strategy:
     def __init__(self, gap_sparse=2500, gap_smart=800):
         self.gap_sparse = gap_sparse
         self.gap_smart = gap_smart
 
-    def sched_dense(gops,nq):
+    def sched_dense(self, gops, nq):
         free=[0]*nq; out=[]
         for g in gops:
             st=max(free[q] for q in g["qs"]); e=st+g["dur"]
@@ -13,14 +13,14 @@ class Strategy:
             out.append({**g,"start":st,"end":e})
         return out
     
-    def sched_sparse(gops):
+    def sched_sparse(self, gops):
         t=0; out=[]
         for g in gops:
             out.append({**g,"start":t,"end":t+g["dur"]}); t+=g["dur"]
         return out
     
-    def sched_smart_offline(gops,nq,model,threshold=0.02):
-        d=sched_dense(gops,nq); dly={}
+    def sched_smart_offline(self, gops, nq, model, threshold=0.02):
+        d=self.sched_dense(gops, nq); dly={}
         for i in range(len(d)):
             for j in range(i+1,len(d)):
                 a,b=d[i],d[j]
@@ -39,7 +39,7 @@ class Strategy:
             out.append({**g,"start":st,"end":e})
         return out
     
-    def sched_smart_online(gops,nq,model,threshold=0.02,cap_factor=1.0):
+    def sched_smart_online(self, gops, nq, model, threshold=0.02, cap_factor=1.0):
         free=[0]*nq; active=[]; out=[]
         for g in gops:
             earliest=max(free[q] for q in g["qs"])
@@ -59,3 +59,7 @@ class Strategy:
             out.append({**g,"start":st,"end":e})
         return out
     
+
+def base_strength(a, b, model):
+    return max(model.crosstalk_lookup.get((a,b),model.default_strength),
+            model.crosstalk_lookup.get((b,a),model.default_strength))

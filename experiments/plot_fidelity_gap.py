@@ -5,63 +5,59 @@ import os
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from src.crosstalk_model import UltimateCrosstalkModel
+from src.crosstalk_model import UltimateCrosstalkModel, extract, pred_total, run_noisy, hellinger
 from src.scheduling import Strategy
 from src.circuits import ghz, qft, rcs
 
 from qiskit_aer import AerSimulator
-from qiskit_aer.noise import NoiseModel
-from qiskit.quantum_info import hellinger_fidelity, state_fidelity
 from qiskit_ibm_runtime.fake_provider import FakeManilaV2
+from qiskit import QuantumCircuit, transpile
+from qiskit.quantum_info import state_fidelity, Statevector
 
-def run_gap_9lines():
+def run():
     backend = FakeManilaV2()
-    model = UltimateCrosstalkModel(backend)
-    strat = Strategy()
+    model   = UltimateCrosstalkModel(backend=backend)
+    sim     = AerSimulator(method="density_matrix")
+    SEED    = 0
+    N       = 5
+    LAMBDAS = np.round(np.arange(0, 5.5, 0.5), 2) 
 
-    sim_meas = AerSimulator.from_backend(backend)
-    sim_dm = AerSimulator(method="density_matrix", noise_model=NoiseModel.from_backend(backend))
+    strategy = Strategy(gap_sparse=2500, gap_smart=800)
 
-    circuits = {"GHZ": ghz(5), "QFT": qft(5), "RCS": rcs(5)}
-    strategies = {"Dense": strat.dense, "Sparse": strat.sparse, "Smart": strat.smart}
-    multipliers = [0, 1, 2, 3, 4, 5]
+    CIRCUITS = [("GHZ", ghz(N)), ("QFT", qft(N)), ("RCS", rcs(N, depth=4, seed=0))]
+    STRATS   = ["Dense", "Smart_Offline", "Smart_Online", "Sparse"]
 
     plt.figure(figsize=(10, 6))
 
-    for cname, qc in circuits.items():
-        for sname, fn in strategies.items():
-            base = fn(qc)
-            sched = model.transpile_and_schedule(base)
+    for cname, cqc in CIRCUITS:
+        base = transpile(cqc, backend, optimization_level=1, seed_transpiler=SEED)
+        gops = extract(base, model); nq = base.num_qubits
+        clean = QuantumCircuit(*base.qregs)
+        for g in gops: clean.append(g["op"], g["qubits"])
+        ideal_sv = Statevector.from_instruction(clean)
 
-            dm0 = sched.copy()
-            dm0.save_density_matrix()
-            rho0 = sim_dm.run(dm0).result().data(0)["density_matrix"]
+        scheds = {
+            "Dense": strategy.sched_dense(gops, nq),
+            "Smart_Offline": strategy.sched_smart_offline(gops, nq, model, threshold=0.02),
+            "Smart_Online": strategy.sched_smart_online(gops, nq, model, threshold=0.02, cap_factor=1.0),
+            "Sparse": strategy.sched_sparse(gops),
+        }
 
-            m0 = sched.copy()
-            m0.measure_all()
-            p0 = sim_meas.run(m0, shots=10000).result().get_counts()
-
+        for strat, ops in scheds.items():
             gaps = []
-            for m in multipliers:
-                if m == 0:
-                    rho, p = rho0, p0
-                else:
-                    ct = model.inject(sched, m)
-                    dm = ct.copy()
-                    dm.save_density_matrix()
-                    rho = sim_dm.run(dm).result().data(0)["density_matrix"]
+            for lam in LAMBDAS:
+                dm = run_noisy(ops, base, model, float(lam), sim)
+                sf = state_fidelity(ideal_sv, dm)
+                hf = hellinger(ideal_sv, dm)
+                gaps.append(sf - hf)
 
-                    meas = ct.copy()
-                    meas.measure_all()
-                    p = sim_meas.run(meas, shots=10000).result().get_counts()
-
-                gaps.append(state_fidelity(rho0, rho) - hellinger_fidelity(p0, p))
-
-            plt.plot(multipliers, gaps, marker="o", label=f"{cname}-{sname}")
+            plt.plot(list(LAMBDAS), gaps, marker="o", label=f"{cname}-{strat}")
+        
+        print(f"  {cname} done")
 
     plt.axhline(0, color="k", linestyle="--", alpha=0.4)
-    plt.xlabel("Crosstalk Multiplier")
-    plt.ylabel("State − Hellinger Fidelity")
+    plt.xlabel("Crosstalk Parameter (λ)")
+    plt.ylabel("State Fidelity − Hellinger Fidelity")
     plt.title("Information Gap Invisible to Measurement")
     plt.legend(fontsize=8)
     plt.grid(alpha=0.3)
@@ -69,4 +65,4 @@ def run_gap_9lines():
     plt.show()
 
 if __name__ == "__main__":
-    run_gap_9lines()
+    run()
