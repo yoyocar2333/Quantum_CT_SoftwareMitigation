@@ -8,6 +8,6 @@ This repository contains the software implementation for generating a time-depen
 
 \#\# Installation  
 \`\`\`bash  
-git clone \[https://github.com/YOUR\_USERNAME/quantum-crosstalk-mitigation.git\](https://github.com/YOUR\_USERNAME/quantum-crosstalk-mitigation.git)  
+git clone \[https://github.com/Mao3831/quantum-crosstalk-mitigation.git\](https://github.com/Mao3831/quantum-crosstalk-mitigation.git)  
 cd quantum-crosstalk-mitigation  
 pip install \-r requirements.txt  
