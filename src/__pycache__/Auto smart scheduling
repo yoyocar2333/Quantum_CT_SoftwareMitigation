@@ -1,0 +1,223 @@
+# ==========================================================
+#  Smart Staggering v3 — 自包含一鍵測試（整格貼上、直接執行）
+#  修正：三策略同一 base 電路、手算排程不被重新轉譯洗掉、掃 lambda
+#  若還沒裝套件先跑：!pip install qiskit qiskit-aer qiskit-ibm-runtime
+# ==========================================================
+import numpy as np
+from qiskit import QuantumCircuit, transpile
+from qiskit.circuit.library import QFTGate, RZGate
+from qiskit.circuit.random import random_circuit
+from qiskit.quantum_info import state_fidelity, Statevector, Operator
+from qiskit_aer import AerSimulator
+from qiskit_aer.noise import depolarizing_error, coherent_unitary_error
+from qiskit_ibm_runtime.fake_provider import FakeManilaV2
+
+# ---------- 串擾模型（只用它的 helper，不再呼叫 build_noisy_circuit） ----------
+class UltimateCrosstalkModel:
+    def __init__(self, backend, crosstalk_lookup=None, default_strength=0.01, kappa=1.5,
+                 include_phase_error=True, seed_transpiler=11, opt_level=1):
+        self.backend=backend; self.coupling=backend.coupling_map
+        self.default_strength=default_strength; self.kappa=kappa
+        self.include_phase_error=include_phase_error
+        self._durations=backend.instruction_durations
+        self.seed_transpiler=seed_transpiler; self.opt_level=opt_level
+        self.crosstalk_lookup=crosstalk_lookup or {('cx','x'):0.08,('x','cx'):0.02,
+                                                   ('cx','cx'):0.12,('x','x'):0.01}
+    def distance_decay(self,d):
+        return 0.0 if (d<1 or d>3) else float(np.exp(-self.kappa*(d-1)))
+    def interaction_distance(self,qs1,qs2):
+        dmin=np.inf
+        for q1 in qs1:
+            for q2 in qs2:
+                if q1==q2: continue
+                try:
+                    d=self.coupling.distance(q1,q2)
+                    if d<dmin: dmin=d
+                except: pass
+        return dmin if dmin!=np.inf else 999
+    def _duration_dt(self,name,qubits):
+        try:
+            d=self._durations.get(name,qubits,unit="dt")
+            if d is not None: return int(d)
+        except: pass
+        return 160
+    def create_error_instruction(self,p,nq):
+        err=depolarizing_error(min(p,1.0),nq)
+        if self.include_phase_error and p>0.001:
+            u=Operator(RZGate(p*np.pi*0.5))
+            if nq>1: u=u.tensor(Operator(np.eye(2)))
+            err=err.compose(coherent_unitary_error(u))
+        return err.to_instruction()
+
+# ---------- 電路產生器 ----------
+def get_ghz_circuit(n):
+    qc=QuantumCircuit(n); qc.h(0)
+    for i in range(n-1): qc.cx(i,i+1)
+    return qc
+def get_qft_circuit(n): return QFTGate(n).definition.decompose()
+def get_rcs_circuit(n,depth=5): return random_circuit(n,depth,measure=False,seed=42)
+
+# ---------- 從 base 取出閘序列（含時長），所有策略共用 ----------
+# 找到 extract 函式，把 dur 那行改成這樣（只差一個 max）：
+def extract(base, model):
+    gops=[]; oid=0
+    for ci in base.data:
+        op=ci.operation
+        if op.name in ("barrier","measure","reset","delay"): continue
+        qs=[base.find_bit(q).index for q in ci.qubits]
+        gops.append({"oid":oid,"name":op.name,"qs":qs,"qubits":ci.qubits,
+                     "op":op,"dur":max(model._duration_dt(op.name,qs), 1)}); oid+=1  # ← 加 max(...,1)
+    return gops
+
+def base_strength(a,b,model):
+    return max(model.crosstalk_lookup.get((a,b),model.default_strength),
+               model.crosstalk_lookup.get((b,a),model.default_strength))
+
+# ---------- 四種排程（手算 start/end，回傳含時間的閘列表） ----------
+def sched_dense(gops,nq):
+    free=[0]*nq; out=[]
+    for g in gops:
+        st=max(free[q] for q in g["qs"]); e=st+g["dur"]
+        for q in g["qs"]: free[q]=e
+        out.append({**g,"start":st,"end":e})
+    return out
+
+def sched_sparse(gops):
+    t=0; out=[]
+    for g in gops:
+        out.append({**g,"start":t,"end":t+g["dur"]}); t+=g["dur"]
+    return out
+
+def sched_smart_offline(gops,nq,model,threshold=0.02):
+    """
+    [Smart-Offline Strategy] 離線全局最優排程
+    具備全局視角(Look-ahead)。先透過預排程掃描所有閘對，
+    精確計算空間距離與時間重疊度，對超過串擾門檻值的受害者閘注入精確延遲。
+    """
+    d=sched_dense(gops,nq); dly={}
+    for i in range(len(d)):
+        for j in range(i+1,len(d)):
+            a,b=d[i],d[j]
+            decay=model.distance_decay(model.interaction_distance(a["qs"],b["qs"]))
+            if decay<1e-3: continue
+            ov=min(a["end"],b["end"])-max(a["start"],b["start"])
+            if ov<=0: continue
+            if base_strength(a["name"],b["name"],model)*decay*(ov/min(a["dur"],b["dur"]))<threshold: continue
+            agg,vic=(a,b) if (a["start"],len(a["qs"]))<=(b["start"],len(b["qs"])) else (b,a)
+            need=int(min(ov,agg["dur"]-1))
+            if need>0: dly[vic["oid"]]=max(dly.get(vic["oid"],0),need)
+    free=[0]*nq; out=[]
+    for g in gops:
+        st=max(free[q] for q in g["qs"])+dly.get(g["oid"],0); e=st+g["dur"]
+        for q in g["qs"]: free[q]=e
+        out.append({**g,"start":st,"end":e})
+    return out
+
+def sched_smart_online(gops,nq,model,threshold=0.02,cap_factor=1.0):
+  """
+    [Smart-Online Strategy] 線上動態因果排程
+    符合因果律(Causal Setting)，無法預知未來電路。
+    維護一個運行時的活動佇列(Active Queue)，新到達的閘僅與當前正在執行的閘進行串擾比對，
+    若發現強侵略者，則動態決策推遲執行，並設有延遲上限(Cap)以平衡退相干錯誤。
+    """
+  free=[0]*nq; active=[]; out=[]
+  for g in gops:
+      earliest=max(free[q] for q in g["qs"])
+      active=[a for a in active if a["end"]>earliest]
+      best,tend=0.0,earliest
+      for a in active:
+          decay=model.distance_decay(model.interaction_distance(a["qs"],g["qs"]))
+          if decay<1e-3: continue
+          ov=a["end"]-earliest
+          if ov<=0: continue
+          sc=base_strength(a["name"],g["name"],model)*decay*(ov/g["dur"])
+          if sc>best: best,tend=sc,a["end"]
+      delay=int(min(max(tend-earliest,0),int(cap_factor*g["dur"]))) if best>=threshold else 0
+      st=earliest+delay; e=st+g["dur"]
+      for q in g["qs"]: free[q]=e
+      active.append({"qs":g["qs"],"name":g["name"],"end":e})
+      out.append({**g,"start":st,"end":e})
+  return out
+
+# ---------- 雜訊注入（直接用手算時間，不再 transpile） ----------
+def p_by_victim(ops,model,lam):
+    p={}
+    for i in range(len(ops)):
+        for j in range(i+1,len(ops)):
+            a,b=ops[i],ops[j]
+            decay=model.distance_decay(model.interaction_distance(a["qs"],b["qs"]))
+            if decay<1e-3: continue
+            ov=min(a["end"],b["end"])-max(a["start"],b["start"])
+            if ov<=0: continue
+            pba=model.crosstalk_lookup.get((b["name"],a["name"]),model.default_strength)*decay*(ov/a["dur"])*lam
+            if pba>1e-6: p.setdefault(a["oid"],[]).append(pba)
+            pab=model.crosstalk_lookup.get((a["name"],b["name"]),model.default_strength)*decay*(ov/b["dur"])*lam
+            if pab>1e-6: p.setdefault(b["oid"],[]).append(pab)
+    return p
+
+def build_noisy(ops,base,model,lam):
+    p=p_by_victim(ops,model,lam)
+    nq=QuantumCircuit(*base.qregs,*base.cregs)
+    for it in sorted(ops,key=lambda x:x["oid"]):
+        nq.append(it["op"],it["qubits"])
+        if it["oid"] in p:
+            ptot=1.0-np.prod([1-x for x in p[it["oid"]]])
+            nq.append(model.create_error_instruction(ptot,len(it["qubits"])),it["qubits"])
+    nq.save_density_matrix(); return nq
+
+def pred_total(ops,model):
+    tot=0.0
+    for i in range(len(ops)):
+        for j in range(i+1,len(ops)):
+            a,b=ops[i],ops[j]
+            decay=model.distance_decay(model.interaction_distance(a["qs"],b["qs"]))
+            if decay<1e-3: continue
+            ov=min(a["end"],b["end"])-max(a["start"],b["start"])
+            if ov<=0: continue
+            tot+=base_strength(a["name"],b["name"],model)*decay*(ov/min(a["dur"],b["dur"]))
+    return tot
+
+# ========================== 跑測試 ==========================
+backend=FakeManilaV2(); model=UltimateCrosstalkModel(backend=backend); SEED=11
+sim=AerSimulator(method="density_matrix")
+ORDER=["Dense","Smart-offline","Smart-online","Sparse"]
+circs={"GHZ":get_ghz_circuit(5),"QFT":get_qft_circuit(5),"RCS":get_rcs_circuit(5,5)}
+LAMBDAS=[0.5,1.0,1.5,2.0,3.0]
+
+for name,qc in circs.items():
+    base=transpile(qc,backend,optimization_level=1,seed_transpiler=SEED)  # 同一顆 base
+    gops=extract(base,model); nq=base.num_qubits
+    clean=QuantumCircuit(*base.qregs)
+    for g in gops: clean.append(g["op"],g["qubits"])
+    ideal=Statevector.from_instruction(clean)
+    variants={"Dense":sched_dense(gops,nq),
+              "Smart-offline":sched_smart_offline(gops,nq,model,0.02),
+              "Smart-online":sched_smart_online(gops,nq,model,0.02),
+              "Sparse":sched_sparse(gops)}
+    base_dur=max(g["end"] for g in variants["Dense"]) or 1
+    print(f"\n================  {name}  ================")
+    print(f"{'Strategy':14}{'Duration':>9}{'Cost':>7}{'PredXtalk(λ=1)':>16}")
+    for s in ORDER:
+        dur=max(g["end"] for g in variants[s])
+        print(f"{s:14}{dur:>9}{dur/base_dur:>6.2f}x{pred_total(variants[s],model):>16.3f}")
+    print(f"\nStateFidelity vs λ:")
+    print("  λ    " + "".join(f"{s:>14}" for s in ORDER))
+    for lam in LAMBDAS:
+        row=[]
+        for s in ORDER:
+            rho=sim.run(build_noisy(variants[s],base,model,lam)).result().data()["density_matrix"]
+            row.append(state_fidelity(ideal,rho))
+        print(f"  {lam:<4}" + "".join(f"{v:>14.4f}" for v in row))
+
+# ---------- threshold 掃描（QFT, online, λ=1.5） ----------
+qc=get_qft_circuit(5); base=transpile(qc,backend,optimization_level=1,seed_transpiler=SEED)
+gops=extract(base,model); nq=base.num_qubits
+clean=QuantumCircuit(*base.qregs)
+for g in gops: clean.append(g["op"],g["qubits"])
+ideal=Statevector.from_instruction(clean)
+print("\n========  threshold sweep (QFT, online, λ=1.5)  ========")
+print(f"{'threshold':>10}{'StateFid':>10}{'Duration':>10}")
+for th in [0.005,0.01,0.02,0.05,0.1]:
+    v=sched_smart_online(gops,nq,model,threshold=th)
+    rho=sim.run(build_noisy(v,base,model,1.5)).result().data()["density_matrix"]
+    print(f"{th:>10}{state_fidelity(ideal,rho):>10.4f}{max(g['end'] for g in v):>10}")
