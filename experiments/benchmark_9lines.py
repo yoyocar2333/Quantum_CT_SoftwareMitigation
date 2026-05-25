@@ -1,109 +1,86 @@
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 import sys
 import os
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from src.crosstalk_model import UltimateCrosstalkModel
+from src.crosstalk_model import UltimateCrosstalkModel, extract, pred_total, run_noisy, hellinger
 from src.scheduling import Strategy
 from src.circuits import ghz, qft, rcs
 
 from qiskit_aer import AerSimulator
-from qiskit_aer.noise import NoiseModel
-from qiskit.quantum_info import hellinger_fidelity, state_fidelity
 from qiskit_ibm_runtime.fake_provider import FakeManilaV2
+from qiskit import QuantumCircuit, transpile
+from qiskit.quantum_info import state_fidelity, Statevector
 
 def run():
-    shots = 10000
-    multipliers = [0, 1, 2, 3, 4, 5]
     backend = FakeManilaV2()
-    
-    model = UltimateCrosstalkModel(backend)
-    strat = Strategy()
-    sim_meas = AerSimulator.from_backend(backend)
-    sim_dm = AerSimulator(method="density_matrix", noise_model=NoiseModel.from_backend(backend))
+    model   = UltimateCrosstalkModel(backend=backend)
+    sim     = AerSimulator(method="density_matrix")
+    SEED    = 0
+    N       = 5
+    LAMBDAS = np.round(np.arange(0, 5.5, 0.5), 2) 
+    TABLE_LAM = 1.0
 
-    circuits = {"GHZ": ghz(5), "QFT": qft(5), "RCS": rcs(5)}
-    strategies = {"Dense": strat.dense, "Sparse": strat.sparse, "Smart": strat.smart}
+    strategy = Strategy(gap_sparse=2500, gap_smart=800)
 
-    curves_H = {}
-    curves_S = {}
-    summary_rows = []
+    CIRCUITS = [("GHZ", ghz(N)), ("QFT", qft(N)), ("RCS", rcs(N, depth=4, seed=0))]
+    STRATS   = ["Dense", "Smart_Offline", "Smart_Online", "Sparse"]
 
-    for cname, qc in circuits.items():
-        dense_duration_ref = None
-        for sname, fn in strategies.items():
-            base = fn(qc)
-            sched = model.transpile_and_schedule(base)
-            
-            duration_dt = int(max(sched.op_start_times)) if len(sched.op_start_times) else 0
-            if sname == "Dense":
-                dense_duration_ref = max(duration_dt, 1)
+    results = {}
+    curves_H = {f"{c}-{s}": [] for c, _ in CIRCUITS for s in STRATS}
+    curves_S = {f"{c}-{s}": [] for c, _ in CIRCUITS for s in STRATS}
 
-            base_dm = sched.copy()
-            base_dm.save_density_matrix()
-            rho0 = sim_dm.run(base_dm).result().data(0)["density_matrix"]
+    for cname, cqc in CIRCUITS:
+        base = transpile(cqc, backend, optimization_level=1, seed_transpiler=SEED)
+        gops = extract(base, model); nq = base.num_qubits
+        clean = QuantumCircuit(*base.qregs)
+        for g in gops: clean.append(g["op"], g["qubits"])
+        ideal_sv = Statevector.from_instruction(clean)
 
-            base_meas = sched.copy()
-            base_meas.measure_all()
-            p0 = sim_meas.run(base_meas, shots=shots).result().get_counts()
+        scheds = {
+            "Dense": strategy.sched_dense(gops, nq),
+            "Smart_Offline": strategy.sched_smart_offline(gops, nq, model, threshold=0.02),
+            "Smart_Online": strategy.sched_smart_online(gops, nq, model, threshold=0.02, cap_factor=1.0),
+            "Sparse": strategy.sched_sparse(gops),
+        }
+        base_dur = max(g["end"] for g in scheds["Dense"]) or 1
 
-            key = f"{cname}-{sname}"
-            curves_H[key] = []
-            curves_S[key] = []
+        for strat, ops in scheds.items():
+            dur = max(g["end"] for g in ops)
+            key = f"{cname}-{strat}"
+            for lam in LAMBDAS:
+                dm = run_noisy(ops, base, model, float(lam), sim)
+                sf = state_fidelity(ideal_sv, dm)
+                hf = hellinger(ideal_sv, dm)
+                results[(cname, strat, float(lam))] = {
+                    "sf":sf, "hf":hf, "dur":dur, "norm_cost":dur/base_dur}
+                curves_H[key].append(hf)
+                curves_S[key].append(sf)
+        print(f"  {cname} done")
 
-            for m in multipliers:
-                if m == 0:
-                    rho, p = rho0, p0
-                else:
-                    ct = model.inject(sched, m)
-                    ct_dm = ct.copy()
-                    ct_dm.save_density_matrix()
-                    rho = sim_dm.run(ct_dm).result().data(0)["density_matrix"]
-
-                    ct_meas = ct.copy()
-                    ct_meas.measure_all()
-                    p = sim_meas.run(ct_meas, shots=shots).result().get_counts()
-
-                curves_H[key].append(hellinger_fidelity(p0, p))
-                curves_S[key].append(state_fidelity(rho0, rho))
-
-            avgH = float(np.mean(curves_H[key]))
-            avgS = float(np.mean(curves_S[key]))
-            summary_rows.append({
-                "Circuit": cname,
-                "Strategy": sname,
-                "AvgHellinger": avgH,
-                "AvgStateFidelity": avgS,
-                "Duration_dt": duration_dt,
-                "NormCost": duration_dt / dense_duration_ref if dense_duration_ref else np.nan,
-            })
-
-    # Plot
+    # Plot Hellinger Fidelity
     plt.figure(figsize=(11, 6))
     for key, vals in curves_H.items():
-        plt.plot(list(multipliers), vals, marker="o", label=key)
-    plt.xlabel("Crosstalk Multiplier")
+        plt.plot(list(LAMBDAS), vals, marker="o", label=key)
+    plt.xlabel("Crosstalk Parameter (λ)")
     plt.ylabel("Hellinger Fidelity")
-    plt.title("Hellinger Fidelity: GHZ/QFT/RCS × Dense/Sparse/Smart")
+    plt.title("Hellinger Fidelity: GHZ/QFT/RCS × Dense/Smart_Offline/Smart_Online/Sparse")
     plt.legend(ncol=3, fontsize=8)
     plt.tight_layout()
     plt.show()
 
+    # Plot State Fidelity
     plt.figure(figsize=(11, 6))
     for key, vals in curves_S.items():
-        plt.plot(list(multipliers), vals, marker="s", linestyle="--", label=key)
-    plt.xlabel("Crosstalk Multiplier")
+        plt.plot(list(LAMBDAS), vals, marker="s", linestyle="--", label=key)
+    plt.xlabel("Crosstalk Parameter (λ)")
     plt.ylabel("State Fidelity")
-    plt.title("State Fidelity: GHZ/QFT/RCS × Dense/Sparse/Smart")
+    plt.title("State Fidelity: GHZ/QFT/RCS × Dense/Smart_Offline/Smart_Online/Sparse")
     plt.legend(ncol=3, fontsize=8)
     plt.tight_layout()
     plt.show()
-
-    df = pd.DataFrame(summary_rows)
-    print(df.to_string(index=False))
 
 if __name__ == "__main__":
     run()
