@@ -8,7 +8,7 @@ This repository contains the software implementation for generating a time-depen
 
 ## Installation  
 ```bash  
-git clone https://github.com/Mao3831/quantum-crosstalk-mitigation.git
-cd quantum-crosstalk-mitigation  
+git clone https://github.com/Mao3831/Quantum_CT_SoftwareMitigation.git
+cd Quantum_CT_SoftwareMitigation  
 pip install -r requirements.txt  
 ```
