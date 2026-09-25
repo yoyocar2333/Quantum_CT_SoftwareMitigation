@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this research prototype, please cite the accompanying course paper."
+title: "Spatio-Temporal Modeling and Software-Based Mitigation of Crosstalk in Quantum Computing"
+type: software
+authors:
+  - family-names: Hsieh
+    given-names: Hao-Hsuan
+  - family-names: Tu
+    given-names: Pin
+  - family-names: Lo
+    given-names: Ting-Hsu
+repository-code: "https://github.com/yoyocar2333/Quantum_CT_SoftwareMitigation"
+keywords:
+  - quantum computing
+  - crosstalk
+  - scheduling
+  - NISQ
+  - fault simulation
+license: MIT
