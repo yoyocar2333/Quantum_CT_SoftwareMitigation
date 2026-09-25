@@ -15,7 +15,7 @@ from qiskit.quantum_info import state_fidelity, Statevector
 
 def run():
     backend = FakeManilaV2()
-    model   = UltimateCrosstalkModel(backend=backend)
+    model   = UltimateCrosstalkModel(backend=backend, kappa=2.0)
     sim     = AerSimulator(method="density_matrix")
     SEED    = 0
     N       = 5
@@ -39,7 +39,7 @@ def run():
         scheds = {
             "Dense": strategy.sched_dense(gops, nq),
             "Smart_Offline": strategy.sched_smart_offline(gops, nq, model, threshold=0.02),
-            "Smart_Online": strategy.sched_smart_online(gops, nq, model, threshold=0.02, cap_factor=1.0),
+            "Smart_Online": strategy.sched_smart_online(gops, nq, model, threshold=0.02, cap_factor=0.8),
             "Sparse": strategy.sched_sparse(gops),
         }
         base_dur = max(g["end"] for g in scheds["Dense"]) or 1
