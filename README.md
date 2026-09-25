@@ -4,6 +4,16 @@ Research prototype for modeling **time-dependent, topology-aware crosstalk** in 
 
 The compiler-level question is simple: dense scheduling reduces latency but increases simultaneous-gate crosstalk; full serialization avoids overlap but is expensive. **Smart Staggering** inserts delays only when the model predicts harmful overlap.
 
+
+## Research trajectory
+
+This repository is the first stage of a two-stage undergraduate research trajectory:
+
+1. **Spatio-temporal crosstalk modeling + Smart Staggering** — model coherent, topology- and overlap-dependent crosstalk and study the fidelity/latency trade-off of selective delay insertion.
+2. **Decision-diagram fault simulation + structure-aware dispatch** — a subsequent course project reframes crosstalk as a hardware-indexed, reproducible fault source for DDFSIM and studies simulator selection across 7 algorithms at 10–12 qubits.
+
+The continuation is summarized in [`docs/CONTINUATION_DDFSIM.md`](docs/CONTINUATION_DDFSIM.md). It is documented separately because the second-stage DDFSIM source is not part of this repository.
+
 ## Contributions
 
 ### 1. Spatio-temporal crosstalk model
